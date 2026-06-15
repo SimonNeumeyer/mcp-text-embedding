@@ -1,0 +1,36 @@
+# --- embedding store state (data, not code) ---
+*.npz
+*.npz.tmp
+data/
+
+# --- model weights / HF cache should never live in the repo ---
+.cache/
+*.bin
+*.safetensors
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- env / secrets ---
+.env
+.env.*
+*.local
+
+# --- logs ---
+*.log
+logs/
+
+# --- editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
