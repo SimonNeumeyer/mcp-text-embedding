@@ -94,8 +94,16 @@ text-embedding add animals --id doc1 --text "..." --overwrite    # replace a key
 text-embedding seed animals corpus.jsonl --overwrite            # bulk import
 text-embedding delete animals --id doc1 --id doc2               # remove ids (repeatable)
 text-embedding info animals                                     # count / classes / dim
+text-embedding ids animals                                      # list all stored ids
+text-embedding plot animals --method tsne                       # 2-D scatter -> PNG
 text-embedding contexts                                         # list all contexts
 ```
+
+`plot` projects a context's embeddings to 2-D and writes a scatter PNG colored by
+`class` (points without one fall under `(unclassified)`). `--method` is `pca` (linear,
+deterministic; the default) or `tsne` (nonlinear; `--seed` makes it reproducible). The
+image goes to `--out` or, by default, `<store-dir>/<context>.<method>.png`. Needs more
+than two points; t-SNE additionally requires `matplotlib` + `scikit-learn`.
 
 `--meta KEY=VALUE` is repeatable (`--meta class=animal --meta src=wiki`). `seed` reads a
 JSON array or JSONL (one object per line), each `{"id": ..., "text": ..., "metadata": {...}}`
