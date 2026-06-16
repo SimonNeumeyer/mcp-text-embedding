@@ -12,6 +12,7 @@ environment (see `config.py`) and `--store-dir` overrides the store location.
   text-embedding seed animals corpus.jsonl --overwrite
   text-embedding delete animals --id doc1 --id doc2
   text-embedding info animals
+  text-embedding ids animals
   text-embedding contexts
 
 `seed` reads either a JSON array of objects or JSONL (one object per line); each
@@ -112,6 +113,9 @@ def main() -> None:
     i = sub.add_parser("info", help="report a context's model, size, and classes")
     i.add_argument("context")
 
+    ids_p = sub.add_parser("ids", help="list all ids stored in a context")
+    ids_p.add_argument("context")
+
     sub.add_parser("contexts", help="list all contexts with a store on disk")
 
     args = p.parse_args()
@@ -164,6 +168,10 @@ def main() -> None:
         print(f"classified: {store.num_classified}")
         print(f"classes:    {', '.join(store.classes) or '(none)'}")
         print(f"dim:        {store.dim}")
+
+    elif args.cmd == "ids":
+        for id_ in store.ids:
+            print(id_)
 
 
 if __name__ == "__main__":
