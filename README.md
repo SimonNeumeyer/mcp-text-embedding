@@ -69,6 +69,11 @@ Every tool except `list_contexts` takes an obligatory `context`.
   probabilities for a fresh `text` or an existing `id`, via a von Mises–Fisher kernel
   density estimate over samples that carry a `class`. `kappa` is the
   concentration/bandwidth (higher → peakier); `prior` is `"uniform"` or `"empirical"`.
+- `density(context, text=None, id=None, kappa=10.0, radius=0.5)` — how crowded the space
+  is around a fresh `text` or an existing `id`, via a von Mises–Fisher kernel density
+  estimate over all stored points. Returns `density` (smooth weight in `(0, 1]`, higher →
+  denser, comparable across queries), `neighbors` (count within cosine `radius`), and
+  `count`. `kappa` is the concentration/bandwidth (higher → more local).
 - `list_keys(context)` — all stored keys.
 - `list_contexts()` — all contexts with a store on disk.
 - `store_info(context)` — pinned model/revision, vector count, dimension, and the

@@ -277,6 +277,46 @@ class EmbeddingStore:
             ((c, s / total) for c, s in scores.items()), key=lambda t: -t[1]
         )
 
+    # --- component 4: local-density use case -----------------------------
+    def density(
+        self,
+        vec: np.ndarray,
+        kappa: float = 10.0,
+        radius: float = 0.5,
+        exclude: str | None = None,
+    ) -> dict:
+        """Estimate how crowded the embedding space is around `vec`. Two views:
+
+          - `density`: mean von Mises-Fisher kernel weight `exp(kappa*(cosine - 1))`
+            over every stored point -- a smooth estimate in (0, 1]. 1.0 means every
+            point sits right on the query; values near 0 mean it is isolated. Same
+            kernel as `classify`, but the exponent is anchored at the theoretical max
+            cosine of 1 rather than a per-query max, so the number is comparable
+            *across* queries -- which is the whole point of a density.
+          - `neighbors`: hard count of stored points with cosine >= `radius`, the
+            intuitive "how many points fall in a ball around the query" view.
+
+        `kappa` is the concentration/bandwidth (higher -> more local). `exclude`
+        (the query's own key) is dropped, and `count` is how many points the
+        estimate ranges over. Returns zeros when the context has no other points.
+        """
+        idx = [i for i in range(len(self.ids)) if self.ids[i] != exclude]
+        if not idx:
+            return {"density": 0.0, "neighbors": 0, "count": 0,
+                    "kappa": kappa, "radius": radius}
+        vec = vec.reshape(-1)
+        mat = self.embeddings[idx]
+        sims = (mat @ vec) / (
+            np.linalg.norm(mat, axis=1) * np.linalg.norm(vec) + 1e-12
+        )
+        return {
+            "density": float(np.exp(kappa * (sims - 1.0)).mean()),
+            "neighbors": int((sims >= radius).sum()),
+            "count": len(idx),
+            "kappa": kappa,
+            "radius": radius,
+        }
+
     # --- introspection ---------------------------------------------------
     @property
     def dim(self) -> int | None:

@@ -122,6 +122,37 @@ def classify(
 
 
 @mcp.tool()
+def density(
+    context: str,
+    text: str | None = None,
+    id: str | None = None,
+    kappa: float = 10.0,
+    radius: float = 0.5,
+) -> dict:
+    """Estimate how crowded the embedding space of `context` is around a query.
+
+    Provide exactly one of `text` (embed a fresh query) or `id` (use an embedding
+    already in the store; it is excluded from its own estimate). Returns a von
+    Mises-Fisher kernel density estimate over all stored points:
+      - `density`: smooth mean kernel weight in (0, 1] -- higher means the query
+        sits in a crowded region; comparable across queries.
+      - `neighbors`: count of stored points within cosine `radius` of the query.
+      - `count`: number of points the estimate ranges over.
+    `kappa` is the concentration/bandwidth (higher -> more local). Useful for
+    spotting novelty/outliers and gauging how well a context covers a region.
+    """
+    if (text is None) == (id is None):
+        raise ValueError("provide exactly one of `text` or `id`")
+    with _lock:
+        store = _get_store(context)
+        if id is not None:
+            vec, exclude = store.vector_for(id), id
+        else:
+            vec, exclude = store.encode(text), None
+        return store.density(vec, kappa=kappa, radius=radius, exclude=exclude)
+
+
+@mcp.tool()
 def list_keys(context: str) -> list[str]:
     """List all keys currently in `context`."""
     with _lock:
