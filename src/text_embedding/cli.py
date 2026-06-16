@@ -13,6 +13,7 @@ environment (see `config.py`) and `--store-dir` overrides the store location.
   text-embedding delete animals --id doc1 --id doc2
   text-embedding info animals
   text-embedding ids animals
+  text-embedding plot animals --method tsne
   text-embedding contexts
 
 `seed` reads either a JSON array of objects or JSONL (one object per line); each
@@ -116,6 +117,15 @@ def main() -> None:
     ids_p = sub.add_parser("ids", help="list all ids stored in a context")
     ids_p.add_argument("context")
 
+    pl = sub.add_parser(
+        "plot", help="render a 2-D scatter of a context's embeddings, colored by class"
+    )
+    pl.add_argument("context")
+    pl.add_argument("--method", choices=("pca", "tsne"), default="pca")
+    pl.add_argument("--out",
+                    help="output PNG path (default: <store-dir>/<context>.<method>.png)")
+    pl.add_argument("--seed", type=int, default=0, help="random seed for t-SNE")
+
     sub.add_parser("contexts", help="list all contexts with a store on disk")
 
     args = p.parse_args()
@@ -172,6 +182,30 @@ def main() -> None:
     elif args.cmd == "ids":
         for id_ in store.ids:
             print(id_)
+
+    elif args.cmd == "plot":
+        try:
+            ids, coords, classes = store.project(args.method, seed=args.seed)
+        except ValueError as e:
+            raise SystemExit(f"plot: {e}")
+        out = Path(args.out) if args.out else path.with_suffix(f".{args.method}.png")
+
+        import matplotlib  # local: only the plot path pays for matplotlib
+        matplotlib.use("Agg")  # no display; must be set before importing pyplot
+        import matplotlib.pyplot as plt
+
+        # one scatter per distinct class so each gets its own color and legend entry
+        labels = [c if c is not None else "(unclassified)" for c in classes]
+        fig, ax = plt.subplots(figsize=(8, 6))
+        for label in sorted(set(labels)):
+            pts = coords[[i for i, lab in enumerate(labels) if lab == label]]
+            ax.scatter(pts[:, 0], pts[:, 1], label=label, s=30, alpha=0.8)
+        ax.set_title(f"{args.context} ({args.method}, {len(ids)} points)")
+        ax.legend(loc="best", fontsize="small")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"plotted {len(ids)} point(s) from {args.context!r} -> {out}")
 
 
 if __name__ == "__main__":

@@ -345,6 +345,44 @@ class EmbeddingStore:
             "radius": radius,
         }
 
+    # --- component 5: visualization use case -----------------------------
+    def project(
+        self, method: str = "pca", dim: int = 2, seed: int = 0
+    ) -> tuple[list[str], np.ndarray, list[str | None]]:
+        """Reduce all stored embeddings to `dim` dims for visualization.
+
+        Returns (ids, coords, classes): coords is an (N, dim) float array, row i the
+        projection of ids[i]; classes[i] is the CLASS_KEY value of ids[i] or None.
+        `method` is "pca" (numpy SVD; linear, deterministic) or "tsne"
+        (sklearn.manifold.TSNE; nonlinear, `seed` makes it reproducible).
+        """
+        if method not in ("pca", "tsne"):
+            raise ValueError("method must be 'pca' or 'tsne'")
+        n = len(self.ids)
+        if n <= dim:
+            raise ValueError(
+                f"need more than {dim} embedding(s) to project to {dim}-D, have {n}"
+            )
+
+        if method == "pca":
+            centered = self.embeddings - self.embeddings.mean(axis=0)
+            u, s, _ = np.linalg.svd(centered, full_matrices=False)
+            coords = u[:, :dim] * s[:dim]
+        else:  # tsne; lazy import like the encoder, so non-tsne paths don't pay for it
+            from sklearn.manifold import TSNE
+
+            # t-SNE requires perplexity < n_samples; clamp for small contexts.
+            perplexity = min(30.0, max(1.0, (n - 1) / 3))
+            coords = TSNE(
+                n_components=dim,
+                init="pca",
+                random_state=seed,
+                perplexity=perplexity,
+            ).fit_transform(self.embeddings)
+
+        classes = [m.get(CLASS_KEY) for m in self.metadata]
+        return list(self.ids), np.asarray(coords, dtype=np.float32), classes
+
     # --- introspection ---------------------------------------------------
     @property
     def dim(self) -> int | None:
