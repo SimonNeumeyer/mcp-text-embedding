@@ -1,4 +1,4 @@
-# myembed-mcp
+# mcp-text-embedding
 
 MCP server over a **keyed semantic text-embedding store**. Embed `(id, text)` with a
 sentence-transformer (semantics over syntax), persist vectors in a `.npz` keyed map, and
@@ -19,7 +19,7 @@ stores are per-deployment state — neither is committed.
 ## Install
 
 ```bash
-conda create -n myembed python=3.12 && conda activate myembed
+conda create -n text-embedding python=3.12 && conda activate text-embedding
 pip install -e .
 ```
 
@@ -27,9 +27,9 @@ pip install -e .
 
 | var | default | purpose |
 |---|---|---|
-| `MYEMBED_MODEL` | `all-mpnet-base-v2` | embedding model (the "mechanism") |
-| `MYEMBED_MODEL_REVISION` | _(latest)_ | pin the HF model commit for reproducibility |
-| `MYEMBED_STORE_DIR` | `~/.local/share/myembed/` | directory holding the per-context `.npz` stores |
+| `TEXT_EMBEDDING_MODEL` | `all-mpnet-base-v2` | embedding model (the "mechanism") |
+| `TEXT_EMBEDDING_MODEL_REVISION` | _(latest)_ | pin the HF model commit for reproducibility |
+| `TEXT_EMBEDDING_STORE_DIR` | `~/.local/share/text-embedding/` | directory holding the per-context `.npz` stores |
 | `HF_HOME` | `~/.cache/huggingface` | where weights cache (point at scratch on a cluster) |
 | `HF_HUB_OFFLINE` | `0` | set `1` to forbid network at request time |
 
@@ -40,7 +40,7 @@ was built with and **refuses to mix mechanisms** — adding with a different mod
 ## Run
 
 ```bash
-myembed-mcp          # starts the MCP server over stdio
+mcp-text-embedding          # starts the MCP server over stdio
 ```
 
 Register with Claude Code (`~/.claude.json` or project `.mcp.json`):
@@ -48,9 +48,9 @@ Register with Claude Code (`~/.claude.json` or project `.mcp.json`):
 ```json
 {
   "mcpServers": {
-    "myembed": {
-      "command": "myembed-mcp",
-      "env": { "MYEMBED_STORE_DIR": "/path/to/stores" }
+    "mcp-text-embedding": {
+      "command": "mcp-text-embedding",
+      "env": { "TEXT_EMBEDDING_STORE_DIR": "/path/to/stores" }
     }
   }
 }
@@ -88,12 +88,13 @@ and seeing what's there. Querying and classifying are the agent's job over the M
 Every command operates on one context (a required positional), except `contexts`.
 
 ```bash
-myembed add animals --id doc1 --text "The cat sat on the mat." --meta class=animal
-echo "long paragraph" | myembed add animals --id doc2          # text from stdin
-myembed add animals --id doc1 --text "..." --overwrite          # replace a key
-myembed seed animals corpus.jsonl --overwrite                   # bulk import
-myembed info animals                                            # count / classes / dim
-myembed contexts                                                # list all contexts
+text-embedding add animals --id doc1 --text "The cat sat on the mat." --meta class=animal
+echo "long paragraph" | text-embedding add animals --id doc2    # text from stdin
+text-embedding add animals --id doc1 --text "..." --overwrite    # replace a key
+text-embedding seed animals corpus.jsonl --overwrite            # bulk import
+text-embedding delete animals --id doc1 --id doc2               # remove ids (repeatable)
+text-embedding info animals                                     # count / classes / dim
+text-embedding contexts                                         # list all contexts
 ```
 
 `--meta KEY=VALUE` is repeatable (`--meta class=animal --meta src=wiki`). `seed` reads a
@@ -117,8 +118,8 @@ Defaults come from the same env vars as the server; override per call with
 Prefetch the weights once on a node with internet, then run offline:
 
 ```bash
-myembed-prefetch                      # on a login node (warms HF_HOME)
-HF_HUB_OFFLINE=1 myembed-mcp          # on a compute node
+text-embedding-prefetch               # on a login node (warms HF_HOME)
+HF_HUB_OFFLINE=1 mcp-text-embedding   # on a compute node
 ```
 
 ## Scaling

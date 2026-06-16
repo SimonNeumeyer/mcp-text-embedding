@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "myembed-mcp"
+name = "mcp-text-embedding"
 version = "0.1.0"
 description = "MCP server for a keyed semantic text-embedding store"
 requires-python = ">=3.10"
@@ -15,9 +15,9 @@ dependencies = [
 ]
 
 [project.scripts]
-myembed = "myembed.cli:main"
-myembed-mcp = "myembed.server:main"
-myembed-prefetch = "myembed.prefetch:main"
+text-embedding = "text_embedding.cli:main"
+mcp-text-embedding = "text_embedding.server:main"
+text-embedding-prefetch = "text_embedding.prefetch:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/myembed"]
+packages = ["src/text_embedding"]

@@ -3,7 +3,7 @@
 Nothing here is committed as data: the repo only declares *which* model by name
 (and optionally a pinned HF revision) and *where* the stores live. The weights
 themselves are fetched into the HuggingFace cache (`HF_HOME`), and the stores are
-per-deployment state under the directory pointed to by `MYEMBED_STORE_DIR`.
+per-deployment state under the directory pointed to by `TEXT_EMBEDDING_STORE_DIR`.
 
 Each *context* is an independent `.npz` store living at `<store_dir>/<context>.npz`,
 so distinct purposes keep separate embedding spaces. Context names are validated
@@ -26,7 +26,7 @@ CONTEXT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 def _default_store_dir() -> Path:
     base = os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
-    return Path(base) / "myembed"
+    return Path(base) / "text-embedding"
 
 
 @dataclass(frozen=True)
@@ -37,10 +37,10 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        store = os.environ.get("MYEMBED_STORE_DIR")
+        store = os.environ.get("TEXT_EMBEDDING_STORE_DIR")
         return cls(
-            model=os.environ.get("MYEMBED_MODEL", DEFAULT_MODEL),
-            revision=os.environ.get("MYEMBED_MODEL_REVISION") or None,
+            model=os.environ.get("TEXT_EMBEDDING_MODEL", DEFAULT_MODEL),
+            revision=os.environ.get("TEXT_EMBEDDING_MODEL_REVISION") or None,
             store_dir=Path(store) if store else _default_store_dir(),
         )
 

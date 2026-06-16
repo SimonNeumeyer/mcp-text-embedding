@@ -5,7 +5,7 @@ Thin wrapper: every tool delegates to an `EmbeddingStore`. There is one store pe
 own `.npz`. Stores are loaded lazily on first use and cached in `_stores`; a single
 global lock guards both the cache and each store op, and writes persist atomically,
 so concurrent tool calls can't corrupt a `.npz`. Because stores are held in memory,
-edits made out-of-band (e.g. `myembed seed` via the CLI) are not picked up until the
+edits made out-of-band (e.g. `text-embedding seed` via the CLI) are not picked up until the
 server restarts.
 
 Uses `fastmcp` (v2), matching the semantic-scholar-mcp repo's convention.
@@ -24,7 +24,7 @@ _cfg = Config.from_env()
 _lock = threading.Lock()
 _stores: dict[str, EmbeddingStore] = {}  # context -> store, lazily populated
 
-mcp = FastMCP("myembed")
+mcp = FastMCP("mcp-text-embedding")
 
 
 def _get_store(context: str) -> EmbeddingStore:

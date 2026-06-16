@@ -7,11 +7,12 @@ they stay one source of truth. Every command operates on one *context* (its own
 `.npz` under the store directory); `contexts` lists them. Defaults come from the
 environment (see `config.py`) and `--store-dir` overrides the store location.
 
-  myembed add animals --id doc1 --text "The cat sat on the mat." --meta class=animal
-  echo "long paragraph" | myembed add animals --id doc2
-  myembed seed animals corpus.jsonl --overwrite
-  myembed info animals
-  myembed contexts
+  text-embedding add animals --id doc1 --text "The cat sat on the mat." --meta class=animal
+  echo "long paragraph" | text-embedding add animals --id doc2
+  text-embedding seed animals corpus.jsonl --overwrite
+  text-embedding delete animals --id doc1 --id doc2
+  text-embedding info animals
+  text-embedding contexts
 
 `seed` reads either a JSON array of objects or JSONL (one object per line); each
 object is `{"id": ..., "text": ..., "metadata": {...}}` with `metadata` optional.
@@ -103,6 +104,11 @@ def main() -> None:
     s.add_argument("--overwrite", action="store_true",
                    help="replace ids already in the store instead of erroring")
 
+    d = sub.add_parser("delete", help="remove one or more ids from a context")
+    d.add_argument("context")
+    d.add_argument("--id", required=True, action="append", dest="ids", metavar="ID",
+                   help="id to delete (repeatable)")
+
     i = sub.add_parser("info", help="report a context's model, size, and classes")
     i.add_argument("context")
 
@@ -140,6 +146,14 @@ def main() -> None:
             raise SystemExit(f"seed: {e.args[0]}")
         store.save(path)
         print(f"seeded {n} item(s) into {args.context!r} ({len(store.ids)} total) -> {path}")
+
+    elif args.cmd == "delete":
+        try:
+            n = store.delete_many(args.ids)
+        except KeyError as e:
+            raise SystemExit(f"delete: {e.args[0]}")
+        store.save(path)
+        print(f"deleted {n} id(s) from {args.context!r} ({len(store.ids)} total) -> {path}")
 
     elif args.cmd == "info":
         rev = f" @ {store.revision}" if store.revision else ""

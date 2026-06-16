@@ -92,7 +92,7 @@ class EmbeddingStore:
         if stored_model != model:
             raise ModelMismatch(
                 f"store {path} was built with model {stored_model!r} but config "
-                f"requests {model!r}; point MYEMBED_STORE_DIR elsewhere or rebuild"
+                f"requests {model!r}; point TEXT_EMBEDDING_STORE_DIR elsewhere or rebuild"
             )
         if revision and stored_rev and revision != stored_rev:
             raise ModelMismatch(
@@ -199,6 +199,26 @@ class EmbeddingStore:
             self.ids.extend(new_ids)
             self.metadata.extend(new_meta)
         return len(items)
+
+    def delete_many(self, keys: list[str]) -> int:
+        """Remove ids and their rows/metadata. Validates all keys exist *before*
+        mutating, so a bad batch fails fast and leaves the store untouched. Rejects
+        in-batch duplicates. Returns the number removed."""
+        keys = list(keys)
+        if not keys:
+            return 0
+        seen: set[str] = set()
+        for key in keys:
+            if key in seen:
+                raise KeyError(f"duplicate id {key!r} in batch")
+            seen.add(key)
+            if key not in self.ids:
+                raise KeyError(f"id {key!r} not in store")
+        drop = {self.ids.index(k) for k in keys}
+        self.embeddings = np.delete(self.embeddings, sorted(drop), axis=0)
+        self.ids = [k for i, k in enumerate(self.ids) if i not in drop]
+        self.metadata = [m for i, m in enumerate(self.metadata) if i not in drop]
+        return len(keys)
 
     # --- component 2: closest-k use case ---------------------------------
     def closest(
