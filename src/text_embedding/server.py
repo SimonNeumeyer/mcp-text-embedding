@@ -4,9 +4,9 @@ Thin wrapper: every tool delegates to an `EmbeddingStore`. There is one store pe
 *context* -- every tool takes an obligatory `context` and operates on that context's
 own `.npz`. Stores are loaded lazily on first use and cached in `_stores`; a single
 global lock guards both the cache and each store op, and writes persist atomically,
-so concurrent tool calls can't corrupt a `.npz`. Because stores are held in memory,
-edits made out-of-band (e.g. `text-embedding seed` via the CLI) are not picked up until the
-server restarts.
+so concurrent tool calls can't corrupt a `.npz`. A cached store is reloaded whenever
+its `.npz` mtime changes on disk, so edits made out-of-band (e.g. `text-embedding seed`
+via the CLI) are picked up on the next tool call -- no server restart required.
 
 Uses `fastmcp` (v2), matching the semantic-scholar-mcp repo's convention.
 """
@@ -23,17 +23,22 @@ from .store import EmbeddingStore
 _cfg = Config.from_env()
 _lock = threading.Lock()
 _stores: dict[str, EmbeddingStore] = {}  # context -> store, lazily populated
+_mtimes: dict[str, float | None] = {}    # context -> .npz mtime when last loaded
 
 mcp = FastMCP("mcp-text-embedding")
 
 
 def _get_store(context: str) -> EmbeddingStore:
-    """Load-or-return the store for `context`. Call only while holding `_lock`."""
-    if context not in _stores:
-        path = _cfg.path_for(context)  # validates the context name
+    """Load-or-reload the store for `context`. Reloads when the context's `.npz`
+    mtime differs from when it was last loaded, so out-of-band CLI writes are picked
+    up without a restart. Call only while holding `_lock`."""
+    path = _cfg.path_for(context)  # validates the context name
+    mtime = path.stat().st_mtime if path.exists() else None
+    if context not in _stores or _mtimes.get(context) != mtime:
         _stores[context] = EmbeddingStore.load(
             path, model=_cfg.model, revision=_cfg.revision
         )
+        _mtimes[context] = mtime
     return _stores[context]
 
 
@@ -65,7 +70,9 @@ def add_texts(
     with _lock:
         store = _get_store(context)
         n = store.add_many(triples, overwrite=overwrite)
-        store.save(_cfg.path_for(context))
+        path = _cfg.path_for(context)
+        store.save(path)
+        _mtimes[context] = path.stat().st_mtime  # our own write; don't reload it next call
         return {
             "added": n,
             "ids": [t[0] for t in triples],
