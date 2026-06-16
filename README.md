@@ -60,9 +60,11 @@ Register with Claude Code (`~/.claude.json` or project `.mcp.json`):
 
 Every tool except `list_contexts` takes an obligatory `context`.
 
-- `add_text(context, id, text, overwrite=False, metadata=None)` — embed and persist under
-  `id`; `metadata` is a free-form map (e.g. `{"class": "animal"}`). On `overwrite` the
-  whole metadata map is replaced.
+- `add_texts(context, items, overwrite=False)` — embed and persist a batch; `items` is a
+  list of `{"id", "text", "metadata"}` objects (`metadata` optional, free-form — its
+  `class` entry is what `classify` scores). Pass a one-element list for a single add. One
+  batched encode and one write; the whole batch is rejected if any id is a duplicate or
+  already present unless `overwrite=True` (which also replaces each matched key's metadata).
 - `closest(context, k=5, text=None, id=None)` — keys of the k closest embeddings to a
   fresh `text` or an existing `id`.
 - `classify(context, text=None, id=None, kappa=10.0, prior="uniform")` — class

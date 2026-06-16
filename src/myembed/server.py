@@ -38,27 +38,37 @@ def _get_store(context: str) -> EmbeddingStore:
 
 
 @mcp.tool()
-def add_text(
+def add_texts(
     context: str,
-    id: str,
-    text: str,
+    items: list[dict],
     overwrite: bool = False,
-    metadata: dict | None = None,
 ) -> dict:
-    """Embed `text` with the pinned model and persist it under key `id` in `context`.
+    """Embed and persist `(id, text)` pairs in `context` in one batched call.
 
-    Pass an optional `metadata` map (e.g. `{"class": "animal"}`); the `class` entry
-    is what `classify` scores against. Set `overwrite=True` to replace an existing
-    key; note this replaces the whole metadata map too, so omitting `metadata` on an
-    overwrite clears it. Returns the key, its metadata, and the new total count.
+    `items` is a list of `{"id": ..., "text": ..., "metadata": {...}}` objects
+    (`metadata` optional, free-form; its `class` entry is what `classify` scores).
+    For a single add, pass a one-element list. One batched encode and one write.
+    The batch is validated up front -- a duplicate id within the batch, or an id
+    already present when `overwrite=False`, rejects the *whole* batch and leaves the
+    store unchanged. Set `overwrite=True` to replace existing keys (this replaces each
+    matched key's whole metadata map too). Returns the number added, the ids, and the
+    new total count.
     """
+    triples = []
+    for i, rec in enumerate(items):
+        if not isinstance(rec, dict) or "id" not in rec or "text" not in rec:
+            raise ValueError(f"item {i} must be an object with 'id' and 'text'")
+        meta = rec.get("metadata", {})
+        if not isinstance(meta, dict):
+            raise ValueError(f"item {i} 'metadata' must be an object")
+        triples.append((str(rec["id"]), str(rec["text"]), meta))
     with _lock:
         store = _get_store(context)
-        store.add(id, text, overwrite=overwrite, metadata=metadata)
+        n = store.add_many(triples, overwrite=overwrite)
         store.save(_cfg.path_for(context))
         return {
-            "id": id,
-            "metadata": metadata or {},
+            "added": n,
+            "ids": [t[0] for t in triples],
             "total": len(store.ids),
             "context": context,
         }
