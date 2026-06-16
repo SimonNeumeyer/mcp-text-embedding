@@ -76,13 +76,20 @@ def add_texts(
 
 @mcp.tool()
 def closest(
-    context: str, k: int = 5, text: str | None = None, id: str | None = None
+    context: str,
+    k: int = 5,
+    text: str | None = None,
+    id: str | None = None,
+    filter: dict | None = None,
 ) -> list[dict]:
     """Return the keys of the k closest stored embeddings in `context` (cosine).
 
     Provide exactly one of `text` (embed a fresh query) or `id` (use an embedding
     already in the store; it is excluded from its own results). Results are ordered
     closest-first as `{"id": ..., "score": ...}`.
+
+    `filter` optionally restricts results to neighbors whose metadata contains
+    every key/value pair in `filter` (subset match).
     """
     if (text is None) == (id is None):
         raise ValueError("provide exactly one of `text` or `id`")
@@ -94,7 +101,9 @@ def closest(
             vec, exclude = store.encode(text), None
         return [
             {"id": key, "score": score}
-            for key, score in store.closest(vec, k, exclude=exclude)
+            for key, score in store.closest(
+                vec, k, exclude=exclude, metadata_filter=filter
+            )
         ]
 
 

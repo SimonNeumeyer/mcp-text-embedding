@@ -222,7 +222,11 @@ class EmbeddingStore:
 
     # --- component 2: closest-k use case ---------------------------------
     def closest(
-        self, vec: np.ndarray, k: int, exclude: str | None = None
+        self,
+        vec: np.ndarray,
+        k: int,
+        exclude: str | None = None,
+        metadata_filter: dict | None = None,
     ) -> list[tuple[str, float]]:
         if len(self.ids) == 0:
             return []
@@ -235,6 +239,10 @@ class EmbeddingStore:
         out: list[tuple[str, float]] = []
         for i in order:
             if exclude is not None and self.ids[i] == exclude:
+                continue
+            if metadata_filter and not (
+                metadata_filter.items() <= self.metadata[i].items()
+            ):
                 continue
             out.append((self.ids[i], float(sims[i])))
             if len(out) == k:
