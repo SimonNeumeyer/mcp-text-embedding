@@ -83,9 +83,9 @@ Every tool except `list_contexts` takes an obligatory `context`.
 
 ## CLI
 
-The CLI is the **ingestion + inspection** side of the store — getting text into a context
-and seeing what's there. Querying and classifying are the agent's job over the MCP server.
-Every command operates on one context (a required positional), except `contexts`.
+The CLI handles ingestion and inspection, plus the batch queries (`classify`, `density`) that
+scripts run without a server; interactive querying still lives on the MCP server. Every command
+operates on one context (a required positional), except `contexts`.
 
 ```bash
 text-embedding add animals --id doc1 --text "The cat sat on the mat." --meta class=animal
@@ -97,7 +97,15 @@ text-embedding info animals                                     # count / classe
 text-embedding ids animals                                      # list all stored ids
 text-embedding plot animals --method tsne                       # 2-D scatter -> PNG
 text-embedding contexts                                         # list all contexts
+text-embedding classify animals queries.jsonl                   # batch class probabilities
+text-embedding density animals queries.jsonl                    # batch density estimate
 ```
+
+`classify` and `density` are query-only: they read the same `{"id", "text"}` JSON array / JSONL
+as `seed` (`metadata` ignored) and print one JSON result per input line to stdout, never touching
+the store — `classify` → `{"id", "classes": [{"class", "probability"}, ...]}` (sorted, `--kappa` /
+`--prior`), `density` → `{"id", "density", "neighbors", "count", ...}` (`--kappa` / `--radius`). An
+empty/unseeded context yields an empty/zero result per id without loading the model.
 
 `plot` projects a context's embeddings to 2-D and writes a scatter PNG colored by
 `class` (points without one fall under `(unclassified)`). `--method` is `pca` (linear,

@@ -1,11 +1,11 @@
 """Command-line interface to the keyed semantic embedding store.
 
-The CLI is the *ingestion* side of the store: it gets text into a context (one
-entry, or a batch file) and reports what's there. Querying and classifying are the
-agent's job over the MCP server -- both front-ends share one `EmbeddingStore`, so
-they stay one source of truth. Every command operates on one *context* (its own
-`.npz` under the store directory); `contexts` lists them. Defaults come from the
-environment (see `config.py`) and `--store-dir` overrides the store location.
+The CLI gets text into a context (one entry, or a batch file), reports what's there,
+and runs the batch queries (`classify`, `density`) that scripts need without a running
+server -- the interactive querying still lives on the MCP server; both front-ends share
+one `EmbeddingStore`, so they stay one source of truth. Every command operates on one
+*context* (its own `.npz` under the store directory); `contexts` lists them. Defaults come
+from the environment (see `config.py`) and `--store-dir` overrides the store location.
 
   text-embedding add animals --id doc1 --text "The cat sat on the mat." --meta class=animal
   echo "long paragraph" | text-embedding add animals --id doc2
@@ -15,6 +15,13 @@ environment (see `config.py`) and `--store-dir` overrides the store location.
   text-embedding ids animals
   text-embedding plot animals --method tsne
   text-embedding contexts
+  text-embedding classify animals queries.jsonl
+  text-embedding density animals queries.jsonl
+
+`classify` and `density` are query-only batch commands: they read a JSON array or JSONL of
+`{"id": ..., "text": ...}` and print one JSON result per line (input order) to stdout, never
+mutating the store -- `classify` -> `{"id", "classes": [{"class", "probability"}, ...]}`,
+`density` -> `{"id", "density", "neighbors", "count", ...}`.
 
 `seed` reads either a JSON array of objects or JSONL (one object per line); each
 object is `{"id": ..., "text": ..., "metadata": {...}}` with `metadata` optional.
@@ -67,6 +74,34 @@ def _to_items(records: list[dict]) -> list[tuple[str, str, dict]]:
             raise SystemExit(f"seed: record {i} 'metadata' must be an object")
         items.append((str(rec["id"]), str(rec["text"]), meta))
     return items
+
+
+def _batch_rows(store, items, *, kind, kappa=10.0, prior="uniform", radius=0.5):
+    """Yield one output dict per (id, text) query for the `classify`/`density` batch commands.
+
+    An empty store yields an empty/zero result per id *without* loading the model (matching the
+    store methods' own empty returns); otherwise one batched encode feeds the per-query estimate.
+    These are query-only -- the store is never mutated or saved.
+    """
+    if not store.ids:
+        for id_, _text, _meta in items:
+            if kind == "classify":
+                yield {"id": id_, "classes": []}
+            else:
+                yield {"id": id_, "density": 0.0, "neighbors": 0, "count": 0,
+                       "kappa": kappa, "radius": radius}
+        return
+    vecs = store.encode_many([text for _id, text, _meta in items])
+    for (id_, _text, _meta), vec in zip(items, vecs):
+        if kind == "classify":
+            classes = [
+                {"class": cls_, "probability": prob}
+                for cls_, prob in store.class_probabilities(
+                    vec, kappa=kappa, prior=prior, exclude=None)
+            ]
+            yield {"id": id_, "classes": classes}
+        else:
+            yield {"id": id_, **store.density(vec, kappa=kappa, radius=radius, exclude=None)}
 
 
 def _parse_meta(pairs: list[str] | None) -> dict:
@@ -128,6 +163,25 @@ def main() -> None:
 
     sub.add_parser("contexts", help="list all contexts with a store on disk")
 
+    cl = sub.add_parser(
+        "classify", help="batch-classify a JSONL file of {id, text} queries against a context"
+    )
+    cl.add_argument("context")
+    cl.add_argument("file", help="path to a JSON array or JSONL file of {id, text} queries")
+    cl.add_argument("--kappa", type=float, default=10.0,
+                    help="vMF concentration/bandwidth (higher -> peakier)")
+    cl.add_argument("--prior", choices=("uniform", "empirical"), default="uniform")
+
+    de = sub.add_parser(
+        "density", help="batch density estimate for a JSONL file of {id, text} queries"
+    )
+    de.add_argument("context")
+    de.add_argument("file", help="path to a JSON array or JSONL file of {id, text} queries")
+    de.add_argument("--kappa", type=float, default=10.0,
+                    help="vMF concentration/bandwidth (higher -> more local)")
+    de.add_argument("--radius", type=float, default=0.5,
+                    help="cosine threshold for the neighbor count")
+
     args = p.parse_args()
     cfg = Config(model=args.model, revision=args.revision, store_dir=Path(args.store_dir))
 
@@ -182,6 +236,18 @@ def main() -> None:
     elif args.cmd == "ids":
         for id_ in store.ids:
             print(id_)
+
+    elif args.cmd == "classify":
+        rows = _batch_rows(store, _to_items(_read_records(args.file)),
+                           kind="classify", kappa=args.kappa, prior=args.prior)
+        for row in rows:
+            print(json.dumps(row, ensure_ascii=False))
+
+    elif args.cmd == "density":
+        rows = _batch_rows(store, _to_items(_read_records(args.file)),
+                           kind="density", kappa=args.kappa, radius=args.radius)
+        for row in rows:
+            print(json.dumps(row, ensure_ascii=False))
 
     elif args.cmd == "plot":
         try:
