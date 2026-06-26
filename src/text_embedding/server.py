@@ -121,15 +121,23 @@ def classify(
     id: str | None = None,
     kappa: float = 10.0,
     prior: str = "uniform",
-) -> list[dict]:
+    calibrate: bool = True,
+) -> dict | list[dict]:
     """Estimate class probabilities for a query within `context` via density estimation.
 
     Provide exactly one of `text` (embed a fresh query) or `id` (use an embedding
     already in the store; it is excluded from its own estimate). Scores the `class`
     metadata of stored samples with a von Mises-Fisher kernel density estimate:
     `kappa` is the concentration/bandwidth (higher -> peakier) and `prior` is
-    "uniform" (default) or "empirical". Returns `{"class": ..., "probability": ...}`
-    ordered most-probable-first; empty if nothing in the context is classified.
+    "uniform" (default) or "empirical".
+
+    With `calibrate=True` (default) the ranking is computed in the validated geometry
+    transform (de-anisotropised / de-hubbed; see `evaluate`) and the result is a dict
+    `{"classes": [{"class", "probability"}, ...], "n_eff", "low_confidence"}`, where
+    `n_eff` is the effective number of samples the estimate rests on. With
+    `calibrate=False` it returns the raw-cosine `[{"class", "probability"}, ...]` list,
+    byte-for-byte with the pre-calibration behaviour. Classes are most-probable-first;
+    empty if nothing in the context is classified.
     """
     if (text is None) == (id is None):
         raise ValueError("provide exactly one of `text` or `id`")
@@ -139,12 +147,19 @@ def classify(
             vec, exclude = store.vector_for(id), id
         else:
             vec, exclude = store.encode(text), None
-        return [
-            {"class": cls_, "probability": prob}
-            for cls_, prob in store.class_probabilities(
-                vec, kappa=kappa, prior=prior, exclude=exclude
-            )
-        ]
+        if not calibrate:
+            return [
+                {"class": cls_, "probability": prob}
+                for cls_, prob in store.class_probabilities(
+                    vec, kappa=kappa, prior=prior, exclude=exclude, calibrate=False
+                )
+            ]
+        r = store.class_scores(vec, kappa=kappa, prior=prior, exclude=exclude, calibrate=True)
+        return {
+            "classes": [{"class": c, "probability": p} for c, p in r["classes"]],
+            "n_eff": r["n_eff"],
+            "low_confidence": r["low_confidence"],
+        }
 
 
 @mcp.tool()
@@ -154,18 +169,22 @@ def density(
     id: str | None = None,
     kappa: float = 10.0,
     radius: float = 0.5,
+    calibrate: bool = True,
 ) -> dict:
     """Estimate how crowded the embedding space of `context` is around a query.
 
     Provide exactly one of `text` (embed a fresh query) or `id` (use an embedding
-    already in the store; it is excluded from its own estimate). Returns a von
-    Mises-Fisher kernel density estimate over all stored points:
-      - `density`: smooth mean kernel weight in (0, 1] -- higher means the query
-        sits in a crowded region; comparable across queries.
-      - `neighbors`: count of stored points within cosine `radius` of the query.
+    already in the store; it is excluded from its own estimate). The reference is every
+    non-background point. Always returns:
+      - `density`: smooth mean kernel weight in (0, 1] -- higher means a crowded region.
+      - `neighbors`: count of reference points within `radius` of the query.
       - `count`: number of points the estimate ranges over.
-    `kappa` is the concentration/bandwidth (higher -> more local). Useful for
-    spotting novelty/outliers and gauging how well a context covers a region.
+    With `calibrate=True` (default) the estimate is computed in the validated geometry
+    transform and the result also carries an honesty layer -- `percentile` (rank of the
+    query's local density against the reference), `lof_score`, `n_eff`, `rank_ci`
+    (bootstrap 95% CI on the percentile) and `low_confidence`. With `calibrate=False`
+    it is the raw-cosine estimate, byte-for-byte with the pre-calibration behaviour.
+    `kappa` is the concentration/bandwidth. Useful for spotting novelty/outliers.
     """
     if (text is None) == (id is None):
         raise ValueError("provide exactly one of `text` or `id`")
@@ -175,7 +194,9 @@ def density(
             vec, exclude = store.vector_for(id), id
         else:
             vec, exclude = store.encode(text), None
-        return store.density(vec, kappa=kappa, radius=radius, exclude=exclude)
+        return store.density(
+            vec, kappa=kappa, radius=radius, exclude=exclude, calibrate=calibrate
+        )
 
 
 @mcp.tool()
@@ -202,8 +223,10 @@ def store_info(context: str) -> dict:
             "revision": store.revision,
             "count": len(store.ids),
             "classified": store.num_classified,
+            "background": store.num_background,
             "classes": store.classes,
             "dim": store.dim,
+            "geometry_config": store.geometry_config,
         }
 
 

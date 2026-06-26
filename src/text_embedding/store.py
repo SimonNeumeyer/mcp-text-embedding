@@ -24,8 +24,22 @@ from pathlib import Path
 
 import numpy as np
 
+from . import geometry
+
 # Metadata key under which a sample's class label is stored, read by `classify`.
 CLASS_KEY = "class"
+
+# Metadata key marking a sample as unlabelled *background*: it feeds the unsupervised
+# geometry transform (lifting n for estimation) but is excluded from classify voting
+# and from the density reference set. Carries no CLASS_KEY.
+BACKGROUND_KEY = "background"
+
+# Calibration only fires once a context holds at least this many points (below it the
+# geometry estimate is meaningless and we fall back to the raw cosine, byte-for-byte).
+MIN_CALIBRATION_POINTS = 8
+
+# Below this Kish effective sample size the estimate rests on too few points to trust.
+MIN_EFFECTIVE_N = 5.0
 
 # One SentenceTransformer per (model, revision), shared across every store in the
 # process so N contexts don't load N copies of the same multi-hundred-MB model.
@@ -53,6 +67,7 @@ class EmbeddingStore:
         model: str,
         revision: str | None = None,
         metadata: list[dict] | None = None,
+        geometry_config: dict | None = None,
     ):
         self.ids = list(ids)
         embeddings = np.asarray(embeddings, dtype=np.float32)
@@ -68,6 +83,11 @@ class EmbeddingStore:
             raise ValueError("metadata must be the same length as ids")
         self.model = model
         self.revision = revision or None
+        # The pipeline `evaluate` selected for this context (None -> a sensible default
+        # at fit time). Persisted so the selection survives the server's mtime reload.
+        self.geometry_config = dict(geometry_config) if geometry_config else None
+        # Lazily-fit unsupervised transform; invalidated on every mutation.
+        self._geometry: geometry.Geometry | None = None
 
     # --- persistence -----------------------------------------------------
     @classmethod
@@ -88,6 +108,11 @@ class EmbeddingStore:
             if "metadata" in data
             else None
         )
+        geometry_config = (
+            json.loads(str(data["geometry_config"]))
+            if "geometry_config" in data and str(data["geometry_config"])
+            else None
+        )
 
         if stored_model != model:
             raise ModelMismatch(
@@ -100,7 +125,8 @@ class EmbeddingStore:
                 f"{revision!r}"
             )
         return cls(list(data["ids"]), data["embeddings"], stored_model,
-                   stored_rev or revision, metadata=metadata)
+                   stored_rev or revision, metadata=metadata,
+                   geometry_config=geometry_config)
 
     def save(self, path: str | Path) -> None:
         """Atomic write: serialize to a temp file, then rename into place."""
@@ -117,6 +143,7 @@ class EmbeddingStore:
                                   dtype=object),
                 model=self.model,
                 revision=self.revision or "",
+                geometry_config=json.dumps(self.geometry_config or {}),
             )
         os.replace(tmp, path)
 
@@ -155,6 +182,7 @@ class EmbeddingStore:
                 self.embeddings = np.vstack([self.embeddings, vec])
             self.ids.append(key)
             self.metadata.append(dict(metadata) if metadata else {})
+        self._geometry = None  # pool changed; refit lazily on next calibrated query
         return vec
 
     def add_many(
@@ -198,6 +226,7 @@ class EmbeddingStore:
             )
             self.ids.extend(new_ids)
             self.metadata.extend(new_meta)
+        self._geometry = None  # pool changed; refit lazily on next calibrated query
         return len(items)
 
     def delete_many(self, keys: list[str]) -> int:
@@ -218,6 +247,7 @@ class EmbeddingStore:
         self.embeddings = np.delete(self.embeddings, sorted(drop), axis=0)
         self.ids = [k for i, k in enumerate(self.ids) if i not in drop]
         self.metadata = [m for i, m in enumerate(self.metadata) if i not in drop]
+        self._geometry = None  # pool changed; refit lazily on next calibrated query
         return len(keys)
 
     # --- component 2: closest-k use case ---------------------------------
@@ -254,6 +284,49 @@ class EmbeddingStore:
             raise KeyError(f"id {key!r} not in store")
         return self.embeddings[self.ids.index(key)]
 
+    # --- geometry calibration --------------------------------------------
+    def _get_geometry(self) -> geometry.Geometry | None:
+        """Lazily fit (and cache) the unsupervised transform over *all* stored points.
+
+        Returns None when the context is too small to estimate geometry, so callers
+        fall back to the raw cosine. Fit on every point (labelled + background) but
+        **never** on labels -- the fit is purely unsupervised. Invalidated on mutation.
+        """
+        if len(self.ids) < MIN_CALIBRATION_POINTS:
+            return None
+        if self._geometry is None:
+            cfg = self.geometry_config or geometry.DEFAULT_CONFIG
+            self._geometry = geometry.fit(self.embeddings.astype(np.float64), cfg)
+        return self._geometry
+
+    def _similarities(
+        self, vec: np.ndarray, idx: list[int], geo: geometry.Geometry | None
+    ) -> np.ndarray:
+        """Query-vs-reference similarities for reference rows `idx`.
+
+        Raw cosine when `geo` is None (the `calibrate=False` path, byte-for-byte with
+        the original code); otherwise cosine in the transformed space, optionally
+        rescored by mutual proximity when the fitted pipeline enables hubness reduction.
+        """
+        vec = vec.reshape(-1)
+        if geo is None:
+            mat = self.embeddings[idx]
+            return (mat @ vec) / (
+                np.linalg.norm(mat, axis=1) * np.linalg.norm(vec) + 1e-12
+            )
+        z_query = geo.transform_vec(vec)
+        ref_z = geo.transform(self.embeddings[idx])
+        base = ref_z @ z_query  # both L2-normalised -> cosine
+        if geo.config.get("hubness") and geo.pool_z is not None:
+            return geo.mp_similarity(z_query, np.asarray(idx), base)
+        return base
+
+    @staticmethod
+    def _effective_n(weights: np.ndarray) -> float:
+        """Kish effective sample size of a weighted estimate: (sum w)^2 / sum(w^2)."""
+        s2 = float((weights**2).sum())
+        return float(weights.sum() ** 2 / s2) if s2 > 0 else 0.0
+
     # --- component 3: class-probability use case -------------------------
     def class_probabilities(
         self,
@@ -261,18 +334,36 @@ class EmbeddingStore:
         kappa: float = 10.0,
         prior: str = "uniform",
         exclude: str | None = None,
+        calibrate: bool = True,
     ) -> list[tuple[str, float]]:
         """von Mises-Fisher kernel density estimate over the classified points.
 
-        A point is classified if its metadata carries a `CLASS_KEY` entry. Weights
-        each such point by `exp(kappa * cosine(vec, point))` -- the vMF kernel, the
-        spherical analogue of a Gaussian on the unit sphere. Aggregated per class and
-        normalized into a posterior over classes:
+        A point is classified if its metadata carries a `CLASS_KEY` entry (background
+        points never do, so they never vote). Weights each such point by
+        `exp(kappa * sim(vec, point))` -- the vMF kernel -- aggregated per class and
+        normalized into a posterior:
           - prior="uniform":   posterior(c) proportional to the *mean* weight in c
           - prior="empirical": posterior(c) proportional to the *summed* weight in c
-        `kappa` is the concentration/bandwidth (higher -> peakier, more like nearest
-        neighbour). Unclassified points and `exclude` are dropped. Returns `(class,
-        probability)` ordered most-probable-first, or `[]` if nothing is classified.
+        With `calibrate=True` (default) `sim` is cosine in the validated transformed
+        space (optionally mutual-proximity rescored); with `calibrate=False` it is the
+        raw cosine, byte-for-byte with the original behaviour. `kappa` is the
+        concentration/bandwidth. Unclassified points and `exclude` are dropped. Returns
+        `(class, probability)` most-probable-first, or `[]` if nothing is classified.
+        """
+        return self.class_scores(vec, kappa, prior, exclude, calibrate)["classes"]
+
+    def class_scores(
+        self,
+        vec: np.ndarray,
+        kappa: float = 10.0,
+        prior: str = "uniform",
+        exclude: str | None = None,
+        calibrate: bool = True,
+    ) -> dict:
+        """`class_probabilities` plus diagnostics (`n_eff`, `low_confidence`, `count`).
+
+        Single source of truth for the ranking; the public method returns only the
+        ranked list so its `calibrate=False` output stays byte-for-byte identical.
         """
         if prior not in ("uniform", "empirical"):
             raise ValueError("prior must be 'uniform' or 'empirical'")
@@ -282,12 +373,9 @@ class EmbeddingStore:
             if self.metadata[i].get(CLASS_KEY) is not None and self.ids[i] != exclude
         ]
         if not idx:
-            return []
-        vec = vec.reshape(-1)
-        mat = self.embeddings[idx]
-        sims = (mat @ vec) / (
-            np.linalg.norm(mat, axis=1) * np.linalg.norm(vec) + 1e-12
-        )
+            return {"classes": [], "n_eff": 0.0, "low_confidence": True, "count": 0}
+        geo = self._get_geometry() if calibrate else None
+        sims = self._similarities(vec, idx, geo)
         # single global max-subtract keeps exp() finite and cancels on normalization
         weights = np.exp(kappa * (sims - sims.max()))
 
@@ -301,9 +389,16 @@ class EmbeddingStore:
             {c: sums[c] / counts[c] for c in sums} if prior == "uniform" else sums
         )
         total = sum(scores.values())
-        return sorted(
+        classes = sorted(
             ((c, s / total) for c, s in scores.items()), key=lambda t: -t[1]
         )
+        n_eff = self._effective_n(weights)
+        return {
+            "classes": classes,
+            "n_eff": n_eff,
+            "low_confidence": n_eff < MIN_EFFECTIVE_N,
+            "count": len(idx),
+        }
 
     # --- component 4: local-density use case -----------------------------
     def density(
@@ -312,38 +407,91 @@ class EmbeddingStore:
         kappa: float = 10.0,
         radius: float = 0.5,
         exclude: str | None = None,
+        calibrate: bool = True,
     ) -> dict:
-        """Estimate how crowded the embedding space is around `vec`. Two views:
+        """Estimate how crowded the embedding space is around `vec`. Core views:
 
-          - `density`: mean von Mises-Fisher kernel weight `exp(kappa*(cosine - 1))`
-            over every stored point -- a smooth estimate in (0, 1]. 1.0 means every
-            point sits right on the query; values near 0 mean it is isolated. Same
-            kernel as `classify`, but the exponent is anchored at the theoretical max
-            cosine of 1 rather than a per-query max, so the number is comparable
-            *across* queries -- which is the whole point of a density.
-          - `neighbors`: hard count of stored points with cosine >= `radius`, the
-            intuitive "how many points fall in a ball around the query" view.
+          - `density`: mean von Mises-Fisher kernel weight `exp(kappa*(sim - 1))` over
+            the reference points -- a smooth estimate in (0, 1], comparable *across*
+            queries because the exponent is anchored at the theoretical max sim of 1.
+          - `neighbors`: hard count of reference points with `sim >= radius`.
 
-        `kappa` is the concentration/bandwidth (higher -> more local). `exclude`
-        (the query's own key) is dropped, and `count` is how many points the
-        estimate ranges over. Returns zeros when the context has no other points.
+        The reference set is every non-background point (background feeds the geometry
+        transform but is not part of the density distribution) except `exclude`. With
+        `calibrate=True` (default) `sim` is computed in the validated transformed space
+        and the result also carries an **honesty layer**: `percentile` (rank of the
+        query's local density against the reference via `LocalOutlierFactor`),
+        `lof_score`, `n_eff` (Kish effective sample size), `rank_ci` (bootstrap 95% CI
+        on the percentile) and a `low_confidence` flag. With `calibrate=False` the
+        output is the raw cosine estimate, byte-for-byte with the original behaviour.
+        Returns zeros when the reference set is empty.
         """
-        idx = [i for i in range(len(self.ids)) if self.ids[i] != exclude]
+        idx = [
+            i
+            for i in range(len(self.ids))
+            if self.ids[i] != exclude and not self.metadata[i].get(BACKGROUND_KEY)
+        ]
         if not idx:
             return {"density": 0.0, "neighbors": 0, "count": 0,
                     "kappa": kappa, "radius": radius}
-        vec = vec.reshape(-1)
-        mat = self.embeddings[idx]
-        sims = (mat @ vec) / (
-            np.linalg.norm(mat, axis=1) * np.linalg.norm(vec) + 1e-12
-        )
-        return {
-            "density": float(np.exp(kappa * (sims - 1.0)).mean()),
+        geo = self._get_geometry() if calibrate else None
+        sims = self._similarities(vec, idx, geo)
+        weights = np.exp(kappa * (sims - 1.0))
+        out = {
+            "density": float(weights.mean()),
             "neighbors": int((sims >= radius).sum()),
             "count": len(idx),
             "kappa": kappa,
             "radius": radius,
         }
+        if geo is not None:
+            out.update(self._density_honesty(vec, idx, geo, weights))
+        return out
+
+    def _density_honesty(
+        self, vec: np.ndarray, idx: list[int], geo: geometry.Geometry, weights: np.ndarray
+    ) -> dict:
+        """Percentile / LOF / n_eff / rank_ci / low_confidence for a calibrated density.
+
+        Ranks the query's local density against the reference with `LocalOutlierFactor`
+        in the novelty representation (`Geometry.transform_novelty`: GD-denoised position
+        plus reconstruction residual, so a query far in *discarded* directions still reads
+        as far). The query and reference are scored on equal footing -- one non-novelty
+        LOF over reference+{query}, so their leave-one-out scores are comparable; a
+        novelty-mode fit would score the *seen* reference as inliers and push every fresh
+        query to percentile ~0. `n_eff` is the Kish effective sample size of the density
+        kernel weights -- the honest count the estimate actually rests on.
+        """
+        n_eff = self._effective_n(weights)
+        info: dict = {"n_eff": n_eff}
+        ref_z = geo.transform_novelty(self.embeddings[idx])
+        z_query = geo.transform_novelty(vec)
+        rank_ci = None
+        if len(idx) >= 3:
+            from sklearn.neighbors import LocalOutlierFactor
+
+            k = min(20, len(idx) - 1)
+            # Reference baseline = each reference point's leave-one-out LOF (fit on the
+            # reference alone). The query gets the same treatment via a fit on
+            # reference+{query}, reading the appended point's score -- so query and
+            # reference are both "held out" and their scores are comparable.
+            ref_scores = LocalOutlierFactor(n_neighbors=k).fit(ref_z).negative_outlier_factor_
+            q_score = float(
+                LocalOutlierFactor(n_neighbors=k)
+                .fit(np.vstack([ref_z, z_query]))
+                .negative_outlier_factor_[-1]
+            )
+            info["lof_score"] = q_score
+            info["percentile"] = float((ref_scores <= q_score).mean())
+            # bootstrap the reference scores for a CI on that percentile
+            rng = np.random.default_rng(0)
+            boot = rng.choice(len(ref_scores), size=(1000, len(ref_scores)), replace=True)
+            pct = np.sort((ref_scores[boot] <= q_score).mean(axis=1))
+            rank_ci = (float(pct[25]), float(pct[975]))
+            info["rank_ci"] = rank_ci
+        wide = rank_ci is not None and (rank_ci[1] - rank_ci[0]) > 0.5
+        info["low_confidence"] = n_eff < MIN_EFFECTIVE_N or wide
+        return info
 
     # --- component 5: visualization use case -----------------------------
     def project(
@@ -383,6 +531,47 @@ class EmbeddingStore:
         classes = [m.get(CLASS_KEY) for m in self.metadata]
         return list(self.ids), np.asarray(coords, dtype=np.float32), classes
 
+    # --- component 6: validated calibration use case ---------------------
+    def evaluate(
+        self,
+        *,
+        k: int = 5,
+        n_folds: int = 5,
+        seed: int = 0,
+        apply_recommended: bool = False,
+    ) -> dict:
+        """Leak-free nested-CV assessment of the geometry transform on the labels.
+
+        Compares the raw-cosine baseline against the best validated pipeline (selected
+        per outer fold, scored only on held-out points) and reports the accuracy delta
+        with a bootstrap CI, hubness before/after, the selection-frequency table, and
+        the config recommended for production. With `apply_recommended=True`, adopts
+        that config as this context's `geometry_config` (persist with `save` to make it
+        durable across the server's mtime reload). Labels are used only to score and
+        select -- never to fit the transform. See `geometry.nested_cv`.
+        """
+        labelled_idx = [
+            i for i in range(len(self.ids)) if self.metadata[i].get(CLASS_KEY) is not None
+        ]
+        labels = [self.metadata[i][CLASS_KEY] for i in labelled_idx]
+        if len(labelled_idx) < 4 or len(set(labels)) < 2:
+            raise ValueError(
+                "evaluate needs at least 4 labelled points across at least 2 classes"
+            )
+        bg_idx = [i for i in range(len(self.ids)) if self.metadata[i].get(BACKGROUND_KEY)]
+        report = geometry.nested_cv(
+            self.embeddings[labelled_idx].astype(np.float64),
+            labels,
+            self.embeddings[bg_idx].astype(np.float64) if bg_idx else None,
+            k=k,
+            n_folds=n_folds,
+            seed=seed,
+        )
+        if apply_recommended:
+            self.geometry_config = report["recommended_config"]
+            self._geometry = None
+        return report
+
     # --- introspection ---------------------------------------------------
     @property
     def dim(self) -> int | None:
@@ -399,3 +588,8 @@ class EmbeddingStore:
     def num_classified(self) -> int:
         """How many samples carry a CLASS_KEY entry in their metadata."""
         return sum(m.get(CLASS_KEY) is not None for m in self.metadata)
+
+    @property
+    def num_background(self) -> int:
+        """How many samples are unlabelled background (feed geometry, never vote)."""
+        return sum(bool(m.get(BACKGROUND_KEY)) for m in self.metadata)

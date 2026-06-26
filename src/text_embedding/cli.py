@@ -9,14 +9,16 @@ from the environment (see `config.py`) and `--store-dir` overrides the store loc
 
   text-embedding add animals --id doc1 --text "The cat sat on the mat." --meta class=animal
   echo "long paragraph" | text-embedding add animals --id doc2
+  text-embedding add animals --id bg1 --text "..." --background
   text-embedding seed animals corpus.jsonl --overwrite
   text-embedding delete animals --id doc1 --id doc2
   text-embedding info animals
   text-embedding ids animals
   text-embedding plot animals --method tsne
   text-embedding contexts
+  text-embedding evaluate animals --apply
   text-embedding classify animals queries.jsonl
-  text-embedding density animals queries.jsonl
+  text-embedding density animals queries.jsonl --no-calibrate
 
 `classify` and `density` are query-only batch commands: they read a JSON array or JSONL of
 `{"id": ..., "text": ...}` and print one JSON result per line (input order) to stdout, never
@@ -40,7 +42,7 @@ import sys
 from pathlib import Path
 
 from .config import Config
-from .store import EmbeddingStore
+from .store import BACKGROUND_KEY, EmbeddingStore
 
 
 def _read_records(path: str) -> list[dict]:
@@ -76,11 +78,13 @@ def _to_items(records: list[dict]) -> list[tuple[str, str, dict]]:
     return items
 
 
-def _batch_rows(store, items, *, kind, kappa=10.0, prior="uniform", radius=0.5):
+def _batch_rows(store, items, *, kind, kappa=10.0, prior="uniform", radius=0.5,
+                calibrate=True):
     """Yield one output dict per (id, text) query for the `classify`/`density` batch commands.
 
     An empty store yields an empty/zero result per id *without* loading the model (matching the
     store methods' own empty returns); otherwise one batched encode feeds the per-query estimate.
+    `calibrate` selects the validated geometry transform (default) or the raw-cosine behaviour.
     These are query-only -- the store is never mutated or saved.
     """
     if not store.ids:
@@ -94,14 +98,16 @@ def _batch_rows(store, items, *, kind, kappa=10.0, prior="uniform", radius=0.5):
     vecs = store.encode_many([text for _id, text, _meta in items])
     for (id_, _text, _meta), vec in zip(items, vecs):
         if kind == "classify":
-            classes = [
-                {"class": cls_, "probability": prob}
-                for cls_, prob in store.class_probabilities(
-                    vec, kappa=kappa, prior=prior, exclude=None)
-            ]
-            yield {"id": id_, "classes": classes}
+            r = store.class_scores(
+                vec, kappa=kappa, prior=prior, exclude=None, calibrate=calibrate)
+            classes = [{"class": c, "probability": p} for c, p in r["classes"]]
+            row = {"id": id_, "classes": classes}
+            if calibrate:
+                row["n_eff"], row["low_confidence"] = r["n_eff"], r["low_confidence"]
+            yield row
         else:
-            yield {"id": id_, **store.density(vec, kappa=kappa, radius=radius, exclude=None)}
+            yield {"id": id_, **store.density(
+                vec, kappa=kappa, radius=radius, exclude=None, calibrate=calibrate)}
 
 
 def _parse_meta(pairs: list[str] | None) -> dict:
@@ -133,6 +139,9 @@ def main() -> None:
     a.add_argument("--text", help="text to embed; omit to read from stdin")
     a.add_argument("--meta", action="append", metavar="KEY=VALUE",
                    help="metadata entry (repeatable); e.g. --meta class=animal")
+    a.add_argument("--background", action="store_true",
+                   help="tag as unlabelled background: feeds the geometry transform but "
+                        "never votes in classify nor counts in the density reference")
     a.add_argument("--overwrite", action="store_true")
 
     s = sub.add_parser("seed", help="bulk-import a JSON/JSONL file into a context")
@@ -171,6 +180,8 @@ def main() -> None:
     cl.add_argument("--kappa", type=float, default=10.0,
                     help="vMF concentration/bandwidth (higher -> peakier)")
     cl.add_argument("--prior", choices=("uniform", "empirical"), default="uniform")
+    cl.add_argument("--no-calibrate", dest="calibrate", action="store_false",
+                    help="use the raw cosine geometry instead of the validated transform")
 
     de = sub.add_parser(
         "density", help="batch density estimate for a JSONL file of {id, text} queries"
@@ -181,6 +192,20 @@ def main() -> None:
                     help="vMF concentration/bandwidth (higher -> more local)")
     de.add_argument("--radius", type=float, default=0.5,
                     help="cosine threshold for the neighbor count")
+    de.add_argument("--no-calibrate", dest="calibrate", action="store_false",
+                    help="use the raw cosine geometry instead of the validated transform")
+
+    ev = sub.add_parser(
+        "evaluate",
+        help="nested-CV report on whether the geometry transform improves the ranking",
+    )
+    ev.add_argument("context")
+    ev.add_argument("--k", type=int, default=5, help="neighbours for the kNN purity metric")
+    ev.add_argument("--folds", type=int, default=5, help="outer cross-validation folds")
+    ev.add_argument("--seed", type=int, default=0)
+    ev.add_argument("--apply", action="store_true",
+                    help="adopt the recommended pipeline as this context's calibration "
+                         "and persist it (used by classify/density with calibrate on)")
 
     args = p.parse_args()
     cfg = Config(model=args.model, revision=args.revision, store_dir=Path(args.store_dir))
@@ -198,9 +223,11 @@ def main() -> None:
 
     if args.cmd == "add":
         text = args.text if args.text is not None else sys.stdin.read()
+        meta = _parse_meta(args.meta)
+        if args.background:
+            meta[BACKGROUND_KEY] = "1"
         try:
-            store.add(args.id, text, overwrite=args.overwrite,
-                      metadata=_parse_meta(args.meta))
+            store.add(args.id, text, overwrite=args.overwrite, metadata=meta)
         except KeyError as e:
             raise SystemExit(f"add: {e.args[0]}")
         store.save(path)
@@ -230,8 +257,10 @@ def main() -> None:
         print(f"model:      {store.model}{rev}")
         print(f"count:      {len(store.ids)}")
         print(f"classified: {store.num_classified}")
+        print(f"background: {store.num_background}")
         print(f"classes:    {', '.join(store.classes) or '(none)'}")
         print(f"dim:        {store.dim}")
+        print(f"calibration:{store.geometry_config or ' (default)'}")
 
     elif args.cmd == "ids":
         for id_ in store.ids:
@@ -239,15 +268,29 @@ def main() -> None:
 
     elif args.cmd == "classify":
         rows = _batch_rows(store, _to_items(_read_records(args.file)),
-                           kind="classify", kappa=args.kappa, prior=args.prior)
+                           kind="classify", kappa=args.kappa, prior=args.prior,
+                           calibrate=args.calibrate)
         for row in rows:
             print(json.dumps(row, ensure_ascii=False))
 
     elif args.cmd == "density":
         rows = _batch_rows(store, _to_items(_read_records(args.file)),
-                           kind="density", kappa=args.kappa, radius=args.radius)
+                           kind="density", kappa=args.kappa, radius=args.radius,
+                           calibrate=args.calibrate)
         for row in rows:
             print(json.dumps(row, ensure_ascii=False))
+
+    elif args.cmd == "evaluate":
+        try:
+            report = store.evaluate(k=args.k, n_folds=args.folds, seed=args.seed,
+                                    apply_recommended=args.apply)
+        except ValueError as e:
+            raise SystemExit(f"evaluate: {e}")
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        if args.apply:
+            store.save(path)
+            print(f"adopted recommended calibration for {args.context!r} -> {path}",
+                  file=sys.stderr)
 
     elif args.cmd == "plot":
         try:
